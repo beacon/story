@@ -5,15 +5,16 @@ import (
 	"sync"
 
 	"github.com/hajimehoshi/ebiten/v2"
+	"github.com/hajimehoshi/ebiten/v2/inpututil"
 )
 
-type EventCallback func(interface{})
+type EventCallback func()
 
 // RenderCache 缓存渲染结果
 type RenderCache struct {
-	image       *ebiten.Image
-	dirty       bool
-	lastBounds  [4]int // x, y, width, height
+	image      *ebiten.Image
+	dirty      bool
+	lastBounds [4]int // x, y, width, height
 }
 
 // NewRenderCache 创建新的渲染缓存
@@ -32,6 +33,8 @@ type NodeInterface interface {
 	SetVisible(bool)
 	GetPosition() (float64, float64)
 	SetPosition(float64, float64)
+	GetSize() (int, int)
+	SetSize(int, int)
 	GetRotation() float64
 	SetRotation(float64)
 	GetScale() (float64, float64)
@@ -42,6 +45,8 @@ type NodeInterface interface {
 	AddChild(NodeInterface)
 	RemoveChild(NodeInterface)
 	GetGlobalPosition() (float64, float64)
+	IsWithin(x, y int) bool // Check if point (x, y) is within the node's bounds
+
 	Update()
 	Draw(*ebiten.Image)
 	IsStatic() bool
@@ -49,21 +54,40 @@ type NodeInterface interface {
 	InvalidateCache()
 	GetCache() *RenderCache
 	SetCache(*RenderCache)
+
+	// Events
+	SetMouseEventHandler(MouseEventHandler)
 }
 
 // Node 是基础节点实现
 type Node struct {
-	name        string
-	visible     bool
-	x, y        float64
-	rotation    float64 // 旋转角度（弧度）
-	scaleX      float64 // X轴缩放
-	scaleY      float64 // Y轴缩放
-	parent      NodeInterface
-	children    []NodeInterface
-	static      bool           // 是否为静态节点
-	cache       *RenderCache   // 渲染缓存
-	mutex       sync.RWMutex   // 保护并发访问
+	name          string
+	visible       bool
+	width, height int // Size in pixels
+	x, y          float64
+	rotation      float64 // 旋转角度（弧度）
+	scaleX        float64 // X轴缩放
+	scaleY        float64 // Y轴缩放
+	parent        NodeInterface
+	children      []NodeInterface
+	static        bool         // 是否为静态节点
+	cache         *RenderCache // 渲染缓存
+	mutex         sync.RWMutex // 保护并发访问
+
+	// Mouse event handlers
+	mouseHasEntered bool
+
+	mouseEventHandler MouseEventHandler
+}
+
+type MouseEventHandler struct {
+	OnClick EventCallback
+	OnHover EventCallback
+	OnLeave EventCallback
+}
+
+func (meh MouseEventHandler) IsEmpty() bool {
+	return meh.OnClick == nil && meh.OnHover == nil && meh.OnLeave == nil
 }
 
 // NewNode 创建新的基础节点
@@ -75,6 +99,12 @@ func NewNode(name string) *Node {
 		scaleY:  1.0,
 		static:  false,
 	}
+}
+
+func (n *Node) WithLock(fn func()) {
+	n.mutex.Lock()
+	fn()
+	n.mutex.Unlock()
 }
 
 // 接口实现
@@ -97,9 +127,10 @@ func (n *Node) GetVisible() bool {
 }
 
 func (n *Node) SetVisible(visible bool) {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-	n.visible = visible
+	n.WithLock(func() {
+		n.visible = visible
+	})
+
 	n.InvalidateCache()
 }
 
@@ -109,11 +140,27 @@ func (n *Node) GetPosition() (float64, float64) {
 	return n.x, n.y
 }
 
+func (n *Node) GetSize() (int, int) {
+	n.mutex.RLock()
+	defer n.mutex.RUnlock()
+	return n.width, n.height
+}
+
+func (n *Node) SetSize(width, height int) {
+	n.WithLock(func() {
+		n.width = width
+		n.height = height
+	})
+
+	n.InvalidateCache()
+}
+
 func (n *Node) SetPosition(x, y float64) {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-	n.x = x
-	n.y = y
+	n.WithLock(func() {
+		n.x = x
+		n.y = y
+	})
+
 	n.InvalidateCache()
 }
 
@@ -124,10 +171,11 @@ func (n *Node) GetRotation() float64 {
 }
 
 func (n *Node) SetRotation(rotation float64) {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-	oldRotation := n.rotation
-	n.rotation = rotation
+	var oldRotation float64
+	n.WithLock(func() {
+		oldRotation = n.rotation
+		n.rotation = rotation
+	})
 	if oldRotation != rotation {
 		n.InvalidateCache()
 	}
@@ -140,14 +188,24 @@ func (n *Node) GetScale() (float64, float64) {
 }
 
 func (n *Node) SetScale(scaleX, scaleY float64) {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-	oldScaleX, oldScaleY := n.scaleX, n.scaleY
-	n.scaleX = scaleX
-	n.scaleY = scaleY
-	if oldScaleX != scaleX || oldScaleY != scaleY {
+	var changed bool
+	n.WithLock(func() {
+		oldScaleX, oldScaleY := n.scaleX, n.scaleY
+		n.scaleX = scaleX
+		n.scaleY = scaleY
+		changed = oldScaleX != scaleX || oldScaleY != scaleY
+	})
+
+	if changed {
 		n.InvalidateCache()
 	}
+}
+
+// IsWithin for Node only checks if point is within rectangular bounds
+func (n *Node) IsWithin(x, y int) bool {
+	globalX, globalY := n.GetGlobalPosition()
+	return x >= int(globalX) && x < int(globalX)+n.width &&
+		y >= int(globalY) && y < int(globalY)+n.height
 }
 
 func (n *Node) GetParent() NodeInterface {
@@ -169,24 +227,26 @@ func (n *Node) GetChildren() []NodeInterface {
 }
 
 func (n *Node) AddChild(child NodeInterface) {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-	child.SetParent(n)
-	n.children = append(n.children, child)
+	n.WithLock(func() {
+		child.SetParent(n)
+		n.children = append(n.children, child)
+	})
+
 	n.InvalidateCache()
 }
 
 func (n *Node) RemoveChild(child NodeInterface) {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-	for i, c := range n.children {
-		if c == child {
-			c.SetParent(nil)
-			n.children = append(n.children[:i], n.children[i+1:]...)
-			n.InvalidateCache()
-			break
+	n.WithLock(func() {
+		for i, c := range n.children {
+			if c == child {
+				c.SetParent(nil)
+				n.children = append(n.children[:i], n.children[i+1:]...)
+				break
+			}
 		}
-	}
+	})
+
+	n.InvalidateCache()
 }
 
 func (n *Node) GetGlobalPosition() (float64, float64) {
@@ -194,7 +254,7 @@ func (n *Node) GetGlobalPosition() (float64, float64) {
 	x, y := n.x, n.y
 	parent := n.parent
 	n.mutex.RUnlock()
-	
+
 	for parent != nil {
 		px, py := parent.GetPosition()
 		x += px
@@ -204,6 +264,10 @@ func (n *Node) GetGlobalPosition() (float64, float64) {
 	return x, y
 }
 
+func (n *Node) SetMouseEventHandler(handler MouseEventHandler) {
+	n.mouseEventHandler = handler
+}
+
 func (n *Node) IsStatic() bool {
 	n.mutex.RLock()
 	defer n.mutex.RUnlock()
@@ -211,18 +275,21 @@ func (n *Node) IsStatic() bool {
 }
 
 func (n *Node) SetStatic(static bool) {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-	oldStatic := n.static
-	n.static = static
-	if oldStatic != static {
+	var changed bool
+	n.WithLock(func() {
+		oldStatic := n.static
+		n.static = static
+		changed = oldStatic != static
+	})
+
+	if changed {
 		n.InvalidateCache()
 	}
 }
 
 func (n *Node) InvalidateCache() {
 	n.mutex.Lock()
-	defer n.mutex.Unlock()
+
 	if n.cache != nil {
 		n.cache.dirty = true
 	}
@@ -230,6 +297,8 @@ func (n *Node) InvalidateCache() {
 	for _, child := range n.children {
 		child.InvalidateCache()
 	}
+
+	n.mutex.Unlock()
 }
 
 func (n *Node) GetCache() *RenderCache {
@@ -244,11 +313,46 @@ func (n *Node) SetCache(cache *RenderCache) {
 	n.cache = cache
 }
 
+func (n *Node) handleMouseEvents() {
+	mouseX, mouseY := ebiten.CursorPosition()
+	globalX, globalY := n.GetGlobalPosition()
+
+	// 检查鼠标是否悬停在按钮上
+	isMouseEntered := mouseX >= int(globalX) && mouseX < int(globalX)+n.width &&
+		mouseY >= int(globalY) && mouseY < int(globalY)+n.height
+
+	if !isMouseEntered && !n.mouseHasEntered {
+		// 从未进入过，直接返回
+		return
+	}
+
+	if isMouseEntered {
+		n.mouseHasEntered = true
+		if n.mouseEventHandler.OnHover != nil {
+			n.mouseEventHandler.OnHover()
+		}
+	} else {
+		n.mouseHasEntered = false
+		if n.mouseEventHandler.OnLeave != nil {
+			n.mouseEventHandler.OnLeave()
+		}
+	}
+
+	if n.mouseHasEntered && inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) && n.mouseEventHandler.OnClick != nil {
+		n.mouseEventHandler.OnClick()
+	}
+}
+
 func (n *Node) Update() {
 	n.mutex.RLock()
 	isStatic := n.static
 	n.mutex.RUnlock()
-	
+
+	// Mouse events
+	if !n.mouseEventHandler.IsEmpty() {
+		n.handleMouseEvents()
+	}
+
 	// 如果是静态节点且有缓存，则不需要频繁更新
 	if !isStatic {
 		for _, child := range n.children {
@@ -269,14 +373,14 @@ func (n *Node) Draw(screen *ebiten.Image) {
 	visible := n.visible
 	static := n.static
 	n.mutex.RUnlock()
-	
+
 	if !visible {
 		return
 	}
-	
+
 	// 尝试使用缓存
 	var renderTarget *ebiten.Image
-	
+
 	if static && n.cache != nil && !n.cache.dirty {
 		// 使用缓存
 		renderTarget = n.cache.image
@@ -288,18 +392,18 @@ func (n *Node) Draw(screen *ebiten.Image) {
 		// 动态节点直接绘制
 		renderTarget = nil
 	}
-	
+
 	if renderTarget != nil {
 		// 使用缓存绘制
 		op := &ebiten.DrawImageOptions{}
-		
+
 		gx, gy := n.GetGlobalPosition()
-		
+
 		// 应用变换
 		op.GeoM.Scale(n.scaleX, n.scaleY)
 		op.GeoM.Rotate(n.rotation)
 		op.GeoM.Translate(gx, gy)
-		
+
 		screen.DrawImage(renderTarget, op)
 	} else {
 		// 动态绘制 - 先绘制自己（如果需要），然后绘制子节点
@@ -310,18 +414,18 @@ func (n *Node) Draw(screen *ebiten.Image) {
 func (n *Node) renderToCache() {
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
-	
+
 	if n.cache == nil {
 		// 估算缓存大小，这里使用固定大小作为示例
 		n.cache = NewRenderCache(800, 600)
 	}
-	
+
 	// 清空缓存
 	n.cache.image.Fill(color.Transparent)
-	
+
 	// 渲染子节点到缓存
 	n.drawChildren(n.cache.image)
-	
+
 	n.cache.dirty = false
 }
 
@@ -331,11 +435,11 @@ func (n *Node) drawChildren(screen *ebiten.Image) {
 	copy(children, n.children)
 	visible := n.visible
 	n.mutex.RUnlock()
-	
+
 	if !visible {
 		return
 	}
-	
+
 	// 绘制所有子节点
 	for _, child := range children {
 		child.Draw(screen)
@@ -346,17 +450,34 @@ func (n *Node) drawChildren(screen *ebiten.Image) {
 type Sprite struct {
 	*Node
 	image     *ebiten.Image
+	mask      *ebiten.Image
 	drawColor color.Color
 }
 
 // NewSprite 创建新的精灵节点
-func NewSprite(name string, img *ebiten.Image) *Sprite {
+func NewSprite(name string, img *ebiten.Image, mask *ebiten.Image) *Sprite {
 	sprite := &Sprite{
 		Node:      NewNode(name),
 		image:     img,
+		mask:      mask,
 		drawColor: color.White,
 	}
+	if mask == nil {
+		sprite.mask = img
+	}
 	return sprite
+}
+
+func (s *Sprite) IsWithin(x, y int) bool {
+	if s.mask == nil {
+		return s.Node.IsWithin(x, y)
+	}
+
+	globalX, globalY := s.GetGlobalPosition()
+	maskX := x - int(globalX)
+	maskY := y - int(globalY)
+	r, _, _, _ := s.mask.At(int(maskX), int(maskY)).RGBA()
+	return r > 0
 }
 
 // SetImage 设置精灵图像
@@ -385,18 +506,18 @@ func (s *Sprite) Draw(screen *ebiten.Image) {
 	}
 
 	op := &ebiten.DrawImageOptions{}
-	
+
 	// 计算全局位置
 	gx, gy := s.GetGlobalPosition()
-	
+
 	// 应用变换
-	centerX := float64(s.image.Bounds().Dx()) / 2
-	centerY := float64(s.image.Bounds().Dy()) / 2
-	op.GeoM.Translate(-centerX, -centerY)
+	// centerX := float64(s.image.Bounds().Dx()) / 2
+	// centerY := float64(s.image.Bounds().Dy()) / 2
+	// op.GeoM.Translate(-centerX, -centerY)
 	op.GeoM.Scale(s.scaleX, s.scaleY)
 	op.GeoM.Rotate(s.rotation)
 	op.GeoM.Translate(gx, gy)
-	
+
 	// 应用颜色滤镜 - 使用 ColorScale 替代 ColorM
 	if s.drawColor != color.White {
 		r, g, b, a := s.drawColor.RGBA()
@@ -407,50 +528,13 @@ func (s *Sprite) Draw(screen *ebiten.Image) {
 			float32(a)/65535.0,
 		)
 	}
-	
+
 	screen.DrawImage(s.image, op)
-	
+
 	// 绘制子节点
 	for _, child := range s.children {
 		child.Draw(screen)
 	}
-}
-
-// ColorRectSprite 是彩色矩形精灵
-type ColorRectSprite struct {
-	*Sprite
-	width, height int
-	rectColor     color.Color
-}
-
-// NewColorRectSprite 创建彩色矩形精灵
-func NewColorRectSprite(name string, width, height int, rectColor color.Color) *ColorRectSprite {
-	img := ebiten.NewImage(width, height)
-	img.Fill(rectColor)
-	
-	sprite := &ColorRectSprite{
-		Sprite:    NewSprite(name, img),
-		width:     width,
-		height:    height,
-		rectColor: rectColor,
-	}
-	
-	return sprite
-}
-
-// UpdateRect 更新矩形颜色
-func (crs *ColorRectSprite) UpdateRect(newColor color.Color) {
-	crs.rectColor = newColor
-	crs.image.Fill(crs.rectColor)
-}
-
-// UpdateSize 更新矩形大小
-func (crs *ColorRectSprite) UpdateSize(width, height int) {
-	crs.width = width
-	crs.height = height
-	newImg := ebiten.NewImage(width, height)
-	newImg.Fill(crs.rectColor)
-	crs.image = newImg
 }
 
 // Camera 相机系统（简化版）
