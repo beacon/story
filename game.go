@@ -10,6 +10,7 @@ import (
 
 // Game 游戏主结构
 type Game struct {
+	rootFn func() *Node
 	root   *Node
 	camera *Camera
 
@@ -51,16 +52,15 @@ func WithBackgroundColor(col color.Color) GameOption {
 	}
 }
 
-func WithRootNode(root *Node) GameOption {
+func WithRootNode(fn func() *Node) GameOption {
 	return func(g *Game) {
-		g.root = root
+		g.rootFn = fn
 	}
 }
 
 // NewGame 创建新游戏实例
 func NewGame(opts ...GameOption) *Game {
 	game := &Game{
-		root:            NewNode("root"),
 		camera:          NewCamera(),
 		backgroundColor: color.RGBA{},
 	}
@@ -78,6 +78,9 @@ func (g *Game) Run() error {
 
 // Update 更新游戏逻辑
 func (g *Game) Update() error {
+	if g.root == nil && g.rootFn != nil {
+		g.root = g.rootFn()
+	}
 	g.root.Update()
 	return nil
 }
